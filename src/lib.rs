@@ -309,6 +309,8 @@ pub struct Request<'headers, 'buf: 'headers> {
     pub path: Option<&'buf str>,
     /// The request version, such as `HTTP/1.1`.
     pub version: Option<u8>,
+    /// The request protocol, such as "HTTP", "RTSP" etc.
+    pub protocol: Option<&'buf str>,
     /// The request headers.
     pub headers: &'headers mut [Header<'buf>]
 }
@@ -321,6 +323,7 @@ impl<'h, 'b> Request<'h, 'b> {
             method: None,
             path: None,
             version: None,
+            protocol: None,
             headers: headers,
         }
     }
@@ -339,7 +342,9 @@ impl<'h, 'b> Request<'h, 'b> {
         complete!(skip_empty_lines(&mut bytes));
         self.method = Some(complete!(parse_token(&mut bytes)));
         self.path = Some(complete!(parse_uri(&mut bytes)));
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let (protocol, version) = complete!(parse_version(&mut bytes));
+        self.protocol = Some(protocol);
+        self.version = Some(version);
         newline!(bytes);
 
         let len = orig_len - bytes.len();
@@ -406,6 +411,8 @@ fn skip_empty_lines(bytes: &mut Bytes) -> Result<()> {
 pub struct Response<'headers, 'buf: 'headers> {
     /// The response version, such as `HTTP/1.1`.
     pub version: Option<u8>,
+    /// The response protocol, such as "HTTP", "RTSP" etc.
+    pub protocol: Option<&'buf str>,
     /// The response code, such as `200`.
     pub code: Option<u16>,
     /// The response reason-phrase, such as `OK`.
@@ -422,6 +429,7 @@ impl<'h, 'b> Response<'h, 'b> {
     pub fn new(headers: &'h mut [Header<'b>]) -> Response<'h, 'b> {
         Response {
             version: None,
+            protocol: None,
             code: None,
             reason: None,
             headers: headers,
@@ -460,7 +468,9 @@ impl<'h, 'b> Response<'h, 'b> {
         let mut bytes = Bytes::new(buf);
 
         complete!(skip_empty_lines(&mut bytes));
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let (protocol, version) = complete!(parse_version(&mut bytes));
+        self.protocol = Some(protocol);
+        self.version = Some(version);
         space!(bytes or Error::Version);
         self.code = Some(complete!(parse_code(&mut bytes)));
 
@@ -528,12 +538,21 @@ pub struct Header<'a> {
 pub const EMPTY_HEADER: Header<'static> = Header { name: "", value: b"" };
 
 #[inline]
-fn parse_version(bytes: &mut Bytes) -> Result<u8> {
+fn parse_version<'a>(bytes: &mut Bytes<'a>) -> Result<(&'a str, u8)> {
     if let Some(mut eight) = bytes.next_8() {
-        expect!(eight._0() => b'H' |? Err(Error::Version));
-        expect!(eight._1() => b'T' |? Err(Error::Version));
-        expect!(eight._2() => b'T' |? Err(Error::Version));
-        expect!(eight._3() => b'P' |? Err(Error::Version));
+        match eight._0() {
+            b'H' => {
+                expect!(eight._1() => b'T' |? Err(Error::Version));
+                expect!(eight._2() => b'T' |? Err(Error::Version));
+                expect!(eight._3() => b'P' |? Err(Error::Version));
+                    },
+            b'R' => {
+                expect!(eight._1() => b'T' |? Err(Error::Version));
+                expect!(eight._2() => b'S' |? Err(Error::Version));
+                expect!(eight._3() => b'P' |? Err(Error::Version));
+            },
+            _ => return Err(Error::Version),
+        }
         expect!(eight._4() => b'/' |? Err(Error::Version));
         expect!(eight._5() => b'1' |? Err(Error::Version));
         expect!(eight._6() => b'.' |? Err(Error::Version));
@@ -542,17 +561,28 @@ fn parse_version(bytes: &mut Bytes) -> Result<u8> {
             b'1' => 1,
             _ => return Err(Error::Version)
         };
-        return Ok(Status::Complete(v))
-    }
+        let protocol = unsafe { str::from_utf8_unchecked(&bytes.slice()[0..=3]) };
+        return Ok(Status::Complete((protocol, v)));
+        }
 
     // else (but not in `else` because of borrow checker)
 
     // If there aren't at least 8 bytes, we still want to detect early
     // if this is a valid version or not. If it is, we'll return Partial.
-    expect!(bytes.next() == b'H' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'P' => Err(Error::Version));
+    match bytes.next() {
+        Some(b'H') => {
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'P' => Err(Error::Version));
+        }
+        Some(b'R') => {
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'S' => Err(Error::Version));
+            expect!(bytes.next() == b'P' => Err(Error::Version));
+        }
+        Some(_) => return Err(Error::Version),
+        None => return Ok(Status::Partial),
+    }
     expect!(bytes.next() == b'/' => Err(Error::Version));
     expect!(bytes.next() == b'1' => Err(Error::Version));
     expect!(bytes.next() == b'.' => Err(Error::Version));
@@ -1199,7 +1229,47 @@ mod tests {
     req! {
         test_request_with_invalid_but_short_version,
         b"GET / HTTP/1!",
-        Err(::Error::Version),
+        Err(crate::Error::Version),
+        |_r| {}
+    }
+
+    req! {
+        test_request_with_rtsp_version,
+        b"GET / RTSP/1.0\n\n",
+        |req| {
+            assert_eq!(req.protocol.unwrap(), "RTSP");
+            assert_eq!(req.version.unwrap(), 0);
+        }
+    }
+
+    req! {
+        test_request_with_short_rtsp_version,
+        b"GET / RTSP/1.",
+        Ok(Status::Partial),
+        |req| {
+            assert_eq!(req.version, None);
+            assert_eq!(req.protocol, None);
+        }
+    }
+
+    req! {
+        test_request_with_empty_method,
+        b" / HTTP/1.1\r\n\r\n",
+        Err(crate::Error::Token),
+        |_r| {}
+    }
+
+    req! {
+        test_request_with_empty_path,
+        b"GET  HTTP/1.1\r\n\r\n",
+        Err(crate::Error::Token),
+        |_r| {}
+    }
+
+    req! {
+        test_request_with_empty_method_and_path,
+        b"  HTTP/1.1\r\n\r\n",
+        Err(crate::Error::Token),
         |_r| {}
     }
 
