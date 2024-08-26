@@ -462,6 +462,8 @@ pub struct Request<'headers, 'buf> {
     pub path: Option<&'buf str>,
     /// The request minor version, such as `1` for `HTTP/1.1`.
     pub version: Option<u8>,
+    /// The request protocol, such as "HTTP", "RTSP" etc.
+    pub protocol: Option<&'buf str>,
     /// The request headers.
     pub headers: &'headers mut [Header<'buf>]
 }
@@ -474,6 +476,7 @@ impl<'h, 'b> Request<'h, 'b> {
             method: None,
             path: None,
             version: None,
+            protocol: None,
             headers,
         }
     }
@@ -496,7 +499,7 @@ impl<'h, 'b> Request<'h, 'b> {
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        (self.protocol, self.version) = Some(complete!(parse_version(&mut bytes))).unzip();
         newline!(bytes);
 
         let len = orig_len - bytes.len();
@@ -607,6 +610,8 @@ fn skip_spaces(bytes: &mut Bytes<'_>) -> Result<()> {
 pub struct Response<'headers, 'buf> {
     /// The response minor version, such as `1` for `HTTP/1.1`.
     pub version: Option<u8>,
+    /// The response protocol, such as "HTTP", "RTSP" etc.
+    pub protocol: Option<&'buf str>,
     /// The response code, such as `200`.
     pub code: Option<u16>,
     /// The response reason-phrase, such as `OK`.
@@ -623,6 +628,7 @@ impl<'h, 'b> Response<'h, 'b> {
     pub fn new(headers: &'h mut [Header<'b>]) -> Response<'h, 'b> {
         Response {
             version: None,
+            protocol: None,
             code: None,
             reason: None,
             headers,
@@ -666,7 +672,9 @@ impl<'h, 'b> Response<'h, 'b> {
         let mut bytes = Bytes::new(buf);
 
         complete!(skip_empty_lines(&mut bytes));
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let (protocol, version) = complete!(parse_version(&mut bytes));
+        self.protocol = Some(protocol);
+        self.version = Some(version);
         space!(bytes or Error::Version);
         if config.allow_multiple_spaces_in_response_status_delimiters {
             complete!(skip_spaces(&mut bytes));
@@ -761,17 +769,19 @@ pub const EMPTY_HEADER: Header<'static> = Header { name: "", value: b"" };
 #[doc(hidden)]
 #[allow(missing_docs)]
 // WARNING: Exported for internal benchmarks, not fit for public consumption
-pub fn parse_version(bytes: &mut Bytes) -> Result<u8> {
+pub fn parse_version(bytes: &mut Bytes) -> Result<(&'static str, u8)> {
     if let Some(eight) = bytes.peek_n::<[u8; 8]>(8) {
         const H10: u64 = u64::from_ne_bytes(*b"HTTP/1.0");
         const H11: u64 = u64::from_ne_bytes(*b"HTTP/1.1");
+        const R10: u64 = u64::from_ne_bytes(*b"RTSP/1.0");
         // SAFETY: peek_n(8) before ensure within bounds
         unsafe {
             bytes.advance(8);
         }
         return match u64::from_ne_bytes(eight) {
-            H10 => Ok(Status::Complete(0)),
-            H11 => Ok(Status::Complete(1)),
+            H10 => Ok(Status::Complete(("HTTP", 0))),
+            H11 => Ok(Status::Complete(("HTTP", 1))),
+            R10 => Ok(Status::Complete(("RTSP", 0))),
             _ => Err(Error::Version),
         };
     }
@@ -780,10 +790,20 @@ pub fn parse_version(bytes: &mut Bytes) -> Result<u8> {
 
     // If there aren't at least 8 bytes, we still want to detect early
     // if this is a valid version or not. If it is, we'll return Partial.
-    expect!(bytes.next() == b'H' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'T' => Err(Error::Version));
-    expect!(bytes.next() == b'P' => Err(Error::Version));
+    match bytes.next() {
+        Some(b'H') => {
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'P' => Err(Error::Version));
+        }
+        Some(b'R') => {
+            expect!(bytes.next() == b'T' => Err(Error::Version));
+            expect!(bytes.next() == b'S' => Err(Error::Version));
+            expect!(bytes.next() == b'P' => Err(Error::Version));
+        }
+        Some(_) => return Err(Error::Version),
+        None => return Ok(Status::Partial),
+    }
     expect!(bytes.next() == b'/' => Err(Error::Version));
     expect!(bytes.next() == b'1' => Err(Error::Version));
     expect!(bytes.next() == b'.' => Err(Error::Version));
@@ -1615,6 +1635,25 @@ mod tests {
         b"GET / HTTP/1!",
         Err(crate::Error::Version),
         |_r| {}
+    }
+
+    req! {
+        test_request_with_rtsp_version,
+        b"GET / RTSP/1.0\n\n",
+        |req| {
+            assert_eq!(req.protocol.unwrap(), "RTSP");
+            assert_eq!(req.version.unwrap(), 0);
+        }
+    }
+
+    req! {
+        test_request_with_short_rtsp_version,
+        b"GET / RTSP/1.",
+        Ok(Status::Partial),
+        |req| {
+            assert_eq!(req.version, None);
+            assert_eq!(req.protocol, None);
+        }
     }
 
     req! {
